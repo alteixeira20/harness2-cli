@@ -20,15 +20,26 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .settings import ConfigError, state_dir
 
-PROVIDER_TYPES = ("anthropic", "openai", "vertex", "bedrock", "claude-login", "chatgpt-login")
+PROVIDER_TYPES = (
+    "anthropic",
+    "openai",
+    "vertex",
+    "bedrock",
+    "claude-login",
+    "chatgpt-login",
+    "agy-login",
+    "gemini",
+)
 USAGE_LIMIT = re.compile(
     r"(?i)usage limit|rate[ _-]?limit|too many requests|\b429\b|quota|credit balance is too low"
+    r"|resource_exhausted"
 )
 STRIP_ENV = (
     "ANTHROPIC_API_KEY",
@@ -41,6 +52,8 @@ STRIP_ENV = (
     "CLAUDE_CODE_USE_VERTEX",
     "CLOUD_ML_REGION",
     "OPENAI_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_GEMINI_BASE_URL",
 )
 
 
@@ -190,12 +203,46 @@ def opencode_config(p: Provider, model: str) -> tuple[dict, dict[str, str]]:
     }, {}
 
 
+def agy_login_home(p: Provider) -> Path | None:
+    return Path(p.home).expanduser() if p.home else None
+
+
+def agy_env_and_settings(
+    p: Provider, base_env: Mapping[str, str] | None = None
+) -> tuple[dict[str, str], dict[str, object]]:
+    """Build environment variables and session settings for an Antigravity CLI run."""
+    if p.type == "agy-login":
+        home = agy_login_home(p)
+        if home is None:
+            return {}, {}
+        return {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local/share"),
+            "XDG_STATE_HOME": str(home / ".local/state"),
+            "XDG_CACHE_HOME": str(home / ".cache"),
+        }, {}
+    if p.type == "gemini":
+        source_env = os.environ if base_env is None else base_env
+        env: dict[str, str] = {}
+        if p.api_key_env:
+            val = source_env.get(p.api_key_env, "")
+            if val:
+                env["GEMINI_API_KEY"] = val
+        if p.base_url:
+            env["GOOGLE_GEMINI_BASE_URL"] = p.base_url
+        return env, {"modelProvider": "gemini"}
+    if p.type in PROVIDER_TYPES:
+        raise ConfigError("Antigravity needs an agy-login or gemini provider.")
+    raise ConfigError(f"unknown provider type {p.type!r}; use one of {PROVIDER_TYPES}")
+
+
 def litellm_params(p: Provider, model: str) -> dict:
-    if p.type in ("claude-login", "chatgpt-login"):
+    if p.type in ("claude-login", "chatgpt-login", "agy-login"):
         raise ConfigError(
             "The bridge needs an API provider; subscription logins are not supported."
         )
-    if p.type in ("anthropic", "openai"):
+    if p.type in ("anthropic", "openai", "gemini"):
         params = {"model": f"{p.type}/{model}", "api_key": f"os.environ/{p.api_key_env}"}
         if p.base_url or p.type == "openai":
             params["api_base"] = p.base_url
@@ -212,6 +259,11 @@ def litellm_params(p: Provider, model: str) -> dict:
 
 
 def check(p: Provider) -> list[str]:
+    if p.type == "agy-login":
+        home = agy_login_home(p)
+        if home is not None and not home.is_dir():
+            return [f"{p.name}: Antigravity profile home does not exist: {home}"]
+        return []
     if p.type == "chatgpt-login":
         home = codex_login_home(p)
         if codex_logged_in(home):
